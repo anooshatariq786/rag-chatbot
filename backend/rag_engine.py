@@ -12,13 +12,10 @@ from langchain_community.document_loaders import (
 from langchain.text_splitter import RecursiveCharacterTextSplitter
 from langchain_community.vectorstores import FAISS
 from langchain_community.embeddings import HuggingFaceEmbeddings
-from langchain.chains import ConversationalRetrievalChain
-from langchain.memory import ConversationBufferWindowMemory
 from langchain_groq import ChatGroq
-from langchain.chat_models import ChatOpenAI
-# Import Anthropic from the older community/chat_models space
+from langchain_openai import ChatOpenAI
 from langchain_community.chat_models import ChatAnthropic
-from langchain.schema import HumanMessage, AIMessage
+from langchain.schema import SystemMessage, HumanMessage, AIMessage
 import logging
 
 logger = logging.getLogger(__name__)
@@ -34,8 +31,8 @@ class RAGEngine:
             model_kwargs={"device": "cpu"},
         )
         self.vectorstore: Optional[FAISS] = None
-        self.metadata: dict = {}          # doc_id -> {filename, chunk_count}
-        self.doc_chunk_ids: dict = {}     # doc_id -> list of chunk indices
+        self.metadata: dict = {}
+        self.doc_chunk_ids: dict = {}
 
         self._load_persisted()
         self.llm = self._init_llm()
@@ -44,22 +41,26 @@ class RAGEngine:
         )
 
     # ------------------------------------------------------------------ #
-    # LLM Selection (priority: Groq > OpenAI > Anthropic > fallback)
+    # LLM Selection (priority: Groq > OpenAI > Anthropic)
     # ------------------------------------------------------------------ #
     def _init_llm(self):
         if os.getenv("GROQ_API_KEY"):
             logger.info("Using Groq LLM")
             return ChatGroq(
                 groq_api_key=os.getenv("GROQ_API_KEY"),
-                model_name="llama3-70b-8192",
+                model="llama-3.3-70b-versatile",
                 temperature=0.2,
             )
         if os.getenv("OPENAI_API_KEY"):
             logger.info("Using OpenAI LLM")
-            return ChatOpenAI(model="gpt-4o-mini", temperature=0.2)
+            return ChatOpenAI(
+                model="gpt-4o-mini",
+                temperature=0.2,
+                api_key=os.getenv("OPENAI_API_KEY"),
+            )
         if os.getenv("ANTHROPIC_API_KEY"):
             logger.info("Using Anthropic LLM")
-            return ChatAnthropic(model="claude-haiku-4-5-20251001", temperature=0.2)
+            return ChatAnthropic(model="claude-haiku-4-5", temperature=0.2)
         raise EnvironmentError(
             "No LLM API key found. Set GROQ_API_KEY, OPENAI_API_KEY, or ANTHROPIC_API_KEY."
         )
@@ -125,16 +126,7 @@ class RAGEngine:
     def delete_document(self, doc_id: str) -> bool:
         if doc_id not in self.metadata:
             return False
-        # Rebuild index without the deleted doc
         if self.vectorstore:
-            all_docs = []
-            for did, meta in self.metadata.items():
-                if did == doc_id:
-                    continue
-                # Re-load isn't trivial with FAISS; simplest approach: mark deleted
-                # For a full rebuild we'd need stored docs — use metadata filter instead
-                pass
-            # Simple approach: filter at query time via metadata
             self.metadata.pop(doc_id, None)
             self._persist()
         return True
@@ -151,7 +143,10 @@ class RAGEngine:
     # ------------------------------------------------------------------ #
     # Query / RAG pipeline
     # ------------------------------------------------------------------ #
-    def query(self, question: str, history: List[dict] = []) -> dict:
+    def query(self, question: str, history: List[dict] = None) -> dict:
+        if history is None:
+            history = []
+
         if self.vectorstore is None or not self.metadata:
             return {
                 "answer": "No documents uploaded yet. Please upload documents first via the Knowledge Base tab.",
@@ -162,38 +157,28 @@ class RAGEngine:
             search_type="mmr", search_kwargs={"k": 4, "fetch_k": 10}
         )
 
-        # Build chat history for LangChain
-        chat_history = []
-        for turn in history[-6:]:         # keep last 3 turns
-            if turn.get("role") == "user":
-                chat_history.append(HumanMessage(content=turn["content"]))
-            elif turn.get("role") == "assistant":
-                chat_history.append(AIMessage(content=turn["content"]))
-
-        # Retrieve relevant chunks
-        relevant_docs = retriever.get_relevant_documents(question)
+        relevant_docs = retriever.invoke(question)
         context = "\n\n".join([d.page_content for d in relevant_docs])
 
-        # Build prompt
         system_prompt = (
             "You are a helpful AI assistant that answers questions based on the provided documents. "
             "Use the following context to answer the question accurately. "
             "If the answer is not in the context, say so clearly.\n\n"
             f"Context:\n{context}"
         )
-        messages = [{"role": "system", "content": system_prompt}]
-        for turn in history[-6:]:
-            messages.append(turn)
-        messages.append({"role": "user", "content": question})
 
-        # Call LLM
-        from langchain.schema import SystemMessage
         lc_messages = [SystemMessage(content=system_prompt)]
-        lc_messages += chat_history
+        for msg in history:
+            role = msg.get("role") if isinstance(msg, dict) else msg[0]
+            content = msg.get("content") if isinstance(msg, dict) else msg[1]
+            if role == "user":
+                lc_messages.append(HumanMessage(content=content))
+            elif role == "assistant":
+                lc_messages.append(AIMessage(content=content))
         lc_messages.append(HumanMessage(content=question))
+
         response = self.llm.invoke(lc_messages)
 
-        # Build sources list (deduplicated by filename)
         seen = set()
         sources = []
         for doc in relevant_docs:
@@ -202,6 +187,7 @@ class RAGEngine:
                 seen.add(fname)
                 sources.append({
                     "filename": fname,
+                    "name": fname,
                     "snippet": doc.page_content[:200] + "...",
                     "doc_id": doc.metadata.get("doc_id", ""),
                 })
